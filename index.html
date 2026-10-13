@@ -19,7 +19,7 @@ html,body{height:100%;margin:0;font:14px/1.35 system-ui,-apple-system,"Segoe UI"
 #ui button:focus-visible,#ui input:focus-visible{outline:2px solid #f2b84b;outline-offset:1px}
 #ui button.on{background:#f2b84b;color:#15202b;border-color:#f2b84b;font-weight:600}
 .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
-.seg button{flex:1}
+.seg button{flex:1;padding:6px 4px!important}
 label{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 input[type=range]{flex:1;accent-color:#f2b84b}
 #q{width:100%;padding:6px 8px;border-radius:7px;border:1px solid #3a5068;background:#0e161e;color:inherit;margin-bottom:8px;font:inherit}
@@ -37,6 +37,7 @@ input[type=range]{flex:1;accent-color:#f2b84b}
     <button data-m="nav" class="on">Navegar</button>
     <button data-m="path">Traçar</button>
     <button data-m="brush">Pincel</button>
+    <button data-m="erase">Borracha</button>
   </div>
   <div id="hint"></div>
   <label>Raio <input id="rad" type="range" min="20" max="500" step="10" value="100"><b id="radv">100 m</b></label>
@@ -89,6 +90,32 @@ function addLine(pts, r, gap) {
     if (d > gap) continue;
     const n = Math.min(Math.ceil(d / Math.max(12, r * .7)), 20000);
     for (let j = 1; j < n; j++) { const t = j / n; add(b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t, r); }
+  }
+}
+function toXY(lat, lon) {
+  const s = Math.sin(Math.max(-85, Math.min(85, lat)) * Math.PI / 180), N = CELL * 2 ** Z;
+  return [(lon + 180) / 360 * N / CELL, (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * N / CELL];
+}
+// Devolve a névoa num disco de raio Re (m). Células cujo círculo toca o disco são removidas;
+// o que sobra do círculo fora do disco é refeito com células pequenas, para não apagar mais que o pedido.
+function erase(lat, lon, Re) {
+  const [fx, fy] = toXY(lat, lon), cx0 = Math.floor(fx), cy0 = Math.floor(fy);
+  const cm = 38.2187 * Math.cos(lat * Math.PI / 180), n = Math.ceil((Re + 500) / cm) + 1, gone = [];
+  for (let dx = -n; dx <= n; dx++) for (let dy = -n; dy <= n; dy++) {
+    const k = (cx0 + dx) * M + (cy0 + dy), r = cells.get(k);
+    if (r !== undefined && Math.hypot(cx0 + dx + .5 - fx, cy0 + dy + .5 - fy) * cm <= Re + r) gone.push([cx0 + dx, cy0 + dy, r, k]);
+  }
+  for (const g of gone) { cells.delete(g[3]); if (cur) cur.push([g[3], g[2]]); }
+  const rr = 0.72 * cm, seen = new Set();
+  for (const [gx, gy, r] of gone) {
+    const m = Math.ceil(r / cm);
+    for (let ox = -m; ox <= m; ox++) for (let oy = -m; oy <= m; oy++) {
+      if (Math.hypot(ox, oy) * cm > r) continue;
+      const ix = gx + ox, iy = gy + oy, k = ix * M + iy;
+      if (seen.has(k) || cells.has(k)) continue;
+      seen.add(k);
+      if (Math.hypot(ix + .5 - fx, iy + .5 - fy) * cm > Re + cm * .5) { cells.set(k, rr); if (cur) cur.push([k, undefined]); }
+    }
   }
 }
 function commit() {
@@ -167,14 +194,16 @@ const $ = id => document.getElementById(id);
 const rad = () => +$('rad').value;
 let mode = 'nav', verts = [];
 const preview = L.polyline([], { color: '#f2b84b', weight: 3, dashArray: '6 6', pane: 'draw' }).addTo(map);
-const hints = { nav: '', path: 'Clique para marcar pontos do caminho; Enter conclui, Esc cancela.', brush: 'Segure e arraste para pintar por onde você passou.' };
+const hints = { nav: '', path: 'Clique para marcar pontos do caminho; Enter conclui, Esc cancela.', brush: 'Segure e arraste para pintar por onde você passou.', erase: 'Arraste para devolver a névoa. O tamanho é o do controle Raio. Desfazer volta o último traço.' };
 function setMode(m) {
   cancelPath(); mode = m;
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.m === m));
   $('hint').textContent = hints[m]; $('done').hidden = m !== 'path';
-  m === 'brush' ? map.dragging.disable() : map.dragging.enable();
+  const paintMode = m === 'brush' || m === 'erase';
+  paintMode ? map.dragging.disable() : map.dragging.enable();
+  if (!paintMode && map.hasLayer(ring)) map.removeLayer(ring);
   map.getContainer().style.cursor = m === 'nav' ? '' : 'crosshair';
-  map.getContainer().style.touchAction = m === 'brush' ? 'none' : '';
+  map.getContainer().style.touchAction = paintMode ? 'none' : '';
 }
 function cancelPath() { verts = []; preview.setLatLngs([]); }
 function finishPath() {
@@ -184,15 +213,26 @@ function finishPath() {
 map.on('click', e => { if (mode !== 'path') return; verts.push([e.latlng.lat, e.latlng.lng]); preview.setLatLngs(verts); });
 
 const con = map.getContainer(); let down = false, last = null;
+const ring = L.circle([0, 0], { radius: 100, color: '#f2b84b', weight: 2, fill: false, interactive: false, pane: 'draw' });
+function showRing(e) { ring.setLatLng(map.mouseEventToLatLng(e)).setRadius(rad()); if (!map.hasLayer(ring)) ring.addTo(map); }
 function paint(e) {
   const p = map.mouseEventToLatLng(e), c = [p.lat, p.lng];
-  addLine(last ? [last, c] : [c], rad(), 1e9); last = c; schedule();
+  if (mode === 'erase') {
+    const R = rad();
+    if (last) {
+      const d = Math.hypot((c[1] - last[1]) * Math.cos(c[0] * Math.PI / 180) * 111320, (c[0] - last[0]) * 110540);
+      const n = Math.max(1, Math.ceil(d / Math.max(10, R / 2)));
+      for (let j = 1; j <= n; j++) { const t = j / n; erase(last[0] + (c[0] - last[0]) * t, last[1] + (c[1] - last[1]) * t, R); }
+    } else erase(c[0], c[1], R);
+  } else addLine(last ? [last, c] : [c], rad(), 1e9);
+  last = c; schedule();
 }
 con.addEventListener('pointerdown', e => {
-  if (mode !== 'brush' || e.button > 0 || e.target.closest('.leaflet-control')) return;
+  if ((mode !== 'brush' && mode !== 'erase') || e.button > 0 || e.target.closest('.leaflet-control')) return;
   down = true; cur = []; last = null; con.setPointerCapture(e.pointerId); paint(e);
 });
-con.addEventListener('pointermove', e => { if (down) paint(e); });
+con.addEventListener('pointermove', e => { if (mode === 'brush' || mode === 'erase') showRing(e); if (down) paint(e); });
+con.addEventListener('pointerleave', () => { if (!down && map.hasLayer(ring)) map.removeLayer(ring); });
 const up = () => { if (down) { down = false; commit(); } };
 con.addEventListener('pointerup', up); con.addEventListener('pointercancel', up);
 
@@ -287,7 +327,7 @@ $('loc').onclick = () => {
 function toast(t) { const e = $('toast'); e.textContent = t; e.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(() => e.style.display = 'none', 5000); }
 function stats() { $('stat').textContent = cells.size.toLocaleString('pt-BR') + ' células reveladas'; }
 document.querySelectorAll('#modes button').forEach(b => b.onclick = () => setMode(b.dataset.m));
-$('rad').oninput = () => $('radv').textContent = rad() + ' m';
+$('rad').oninput = () => { $('radv').textContent = rad() + ' m'; ring.setRadius(rad()); };
 $('done').onclick = finishPath; $('undo').onclick = undo;
 $('imp').onclick = () => $('file').click();
 $('file').onchange = e => { importFiles([...e.target.files]); e.target.value = ''; };
