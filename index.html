@@ -126,12 +126,9 @@ function exportBackup() {
 const map = L.map('map', { zoomControl: false, zoomAnimation: false, doubleClickZoom: false, worldCopyJump: false, minZoom: 2 });
 L.control.zoom({ position: 'bottomright' }).addTo(map);
 const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' });
-const carto = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { maxZoom: 19, subdomains: 'abcd', attribution: '© OpenStreetMap, © CARTO' });
 const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Esri' });
 osm.addTo(map);
-L.control.layers({ 'OpenStreetMap': osm, 'Carto (dados OSM)': carto, 'Satélite': sat }, null, { position: 'topright' }).addTo(map);
-let tileErr = 0;
-osm.on('tileerror', () => { if (++tileErr === 4 && map.hasLayer(osm)) { map.removeLayer(osm); carto.addTo(map); toast('O OSM bloqueou os tiles neste modo de abertura; troquei para o Carto (mesmos dados OSM).'); } });
+L.control.layers({ 'OpenStreetMap': osm, 'Satélite': sat }, null, { position: 'topright' }).addTo(map);
 
 /* ---------- Névoa (canvas) ---------- */
 map.createPane('fog').style.zIndex = 450;
@@ -214,7 +211,14 @@ function parseFile(name, text) {
     if (g.length) lines.push(g);
     return { lines, gap };
   }
-  const j = JSON.parse(text);
+  let j;
+  try { j = JSON.parse(text); } catch (e) {
+    // JSON cortado ou inválido: varre as coordenadas direto no texto, na ordem em que aparecem
+    const pts = [], rx2 = /(-?\d{1,3}\.\d+)\s*°\s*,\s*(-?\d{1,3}\.\d+)\s*°/g; let m;
+    while ((m = rx2.exec(text))) pts.push([+m[1], +m[2]]);
+    if (!pts.length) throw e;
+    lines.push(pts); return { lines, gap: 5000 };
+  }
   if (j && j.type) {
     const coords = c => {
       if (!Array.isArray(c) || !c.length) return;
@@ -246,23 +250,23 @@ function parseFile(name, text) {
   return { lines, gap };
 }
 async function importFiles(files) {
-  const before = cells.size; cur = []; added = 0; let n = 0;
+  const before = cells.size; cur = []; let n = 0; const fail = [];
   for (const f of files) {
     try {
-      const text = await f.text(); let j = null;
-      try { j = JSON.parse(text); } catch (e) {}
-      if (j && j.app === 'mapa-desbloqueavel') {
+      const text = await f.text();
+      if (text.slice(0, 80).includes('mapa-desbloqueavel')) {
+        const j = JSON.parse(text);
         for (let i = 0; i < j.cells.length; i += 2) { const k = j.cells[i], r = j.cells[i + 1], p = cells.get(k); if (p === undefined || p < r) { cells.set(k, r); cur.push([k, p]); } }
         n++; continue;
       }
       const { lines, gap } = parseFile(f.name, text);
       lines.forEach(l => addLine(l, rad(), gap)); n++;
-    } catch (e) { toast('Não consegui ler ' + f.name); }
+    } catch (e) { fail.push(f.name); }
   }
   commit();
   const novas = cells.size - before;
-  toast(n + ' arquivo(s) importado(s): ' + novas.toLocaleString('pt-BR') + ' novas células reveladas.');
-  const k = cells.keys().next().value;
+  toast((n ? n + ' arquivo(s) importado(s): ' + novas.toLocaleString('pt-BR') + ' novas células reveladas. ' : '') + (fail.length ? 'Não consegui ler: ' + fail.join(', ') : ''));
+  if (novas) { const [k, ] = cells.entries().next().value, cx = Math.floor(k / M), cy = k - cx * M, N = 2 ** Z; map.setView([Math.atan(Math.sinh(Math.PI * (1 - 2 * (cy + .5) / N))) * 180 / Math.PI, (cx + .5) / N * 360 - 180], Math.max(map.getZoom(), 12)); }
 }
 
 /* ---------- Posição ao vivo ---------- */
