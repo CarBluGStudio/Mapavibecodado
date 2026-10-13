@@ -24,6 +24,11 @@ label{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 input[type=range]{flex:1;accent-color:#f2b84b}
 #q{width:100%;padding:6px 8px;border-radius:7px;border:1px solid #3a5068;background:#0e161e;color:inherit;margin-bottom:8px;font:inherit}
 #stat{color:#9fb0c0;font-size:12px}
+#confirm{position:absolute;z-index:1100;left:50%;bottom:70px;transform:translateX(-50%);background:#15202bf2;color:#e8edf2;padding:12px 14px;border-radius:10px;box-shadow:0 4px 18px #0006;max-width:92%;text-align:center}
+#confirm[hidden]{display:none}
+#confirm button{font:inherit;color:inherit;background:#26384a;border:1px solid #3a5068;border-radius:7px;padding:7px 12px;cursor:pointer}
+#confirm button.on{background:#f2b84b;color:#15202b;border-color:#f2b84b;font-weight:600}
+#confirm .row{justify-content:center}
 #hint{color:#f2b84b;font-size:12px;margin-bottom:8px;min-height:1em}
 #toast{position:absolute;z-index:1100;left:50%;bottom:22px;transform:translateX(-50%);background:#15202bf2;color:#fff;padding:9px 14px;border-radius:8px;max-width:90%;display:none}
 #fog{pointer-events:none}
@@ -38,9 +43,11 @@ input[type=range]{flex:1;accent-color:#f2b84b}
     <button data-m="path">Traçar</button>
     <button data-m="brush">Pincel</button>
     <button data-m="erase">Borracha</button>
+    <button data-m="route">Rota</button>
   </div>
   <div id="hint"></div>
   <label>Raio <input id="rad" type="range" min="20" max="500" step="10" value="100"><b id="radv">100 m</b></label>
+  <div class="row" id="rbox" hidden><button id="rgo">Calcular rota</button><button id="rclr">Limpar pontos</button></div>
   <div class="row">
     <button id="done" hidden>Concluir trecho</button>
     <button id="undo">Desfazer</button>
@@ -56,6 +63,7 @@ input[type=range]{flex:1;accent-color:#f2b84b}
   <div class="row" style="margin:8px 0 0"><button id="wipe">Apagar tudo</button></div>
   <input type="file" id="file" accept=".gpx,.kml,.xml,.json,.geojson" multiple hidden>
 </div>
+<div id="confirm" hidden><div id="csum"></div><div class="row" style="margin:8px 0 0"><button id="cok" class="on">Revelar rota</button><button id="cno">Voltar</button></div></div>
 <div id="toast"></div>
 
 <script>
@@ -194,9 +202,9 @@ const $ = id => document.getElementById(id);
 const rad = () => +$('rad').value;
 let mode = 'nav', verts = [];
 const preview = L.polyline([], { color: '#f2b84b', weight: 3, dashArray: '6 6', pane: 'draw' }).addTo(map);
-const hints = { nav: '', path: 'Clique para marcar pontos do caminho; Enter conclui, Esc cancela.', brush: 'Segure e arraste para pintar por onde você passou.', erase: 'Arraste para devolver a névoa. O tamanho é o do controle Raio. Desfazer volta o último traço.' };
+const hints = { nav: '', path: 'Clique para marcar pontos do caminho; Enter conclui, Esc cancela.', brush: 'Segure e arraste para pintar por onde você passou.', route: 'Clique no mapa para marcar origem (A) e destino (B), ou digite um lugar na busca e tecle Enter.', erase: 'Arraste para devolver a névoa. O tamanho é o do controle Raio. Desfazer volta o último traço.' };
 function setMode(m) {
-  cancelPath(); mode = m;
+  cancelPath(); clearRoute(); mode = m; $('rbox').hidden = m !== 'route';
   document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.m === m));
   $('hint').textContent = hints[m]; $('done').hidden = m !== 'path';
   const paintMode = m === 'brush' || m === 'erase';
@@ -235,6 +243,44 @@ con.addEventListener('pointermove', e => { if (mode === 'brush' || mode === 'era
 con.addEventListener('pointerleave', () => { if (!down && map.hasLayer(ring)) map.removeLayer(ring); });
 const up = () => { if (down) { down = false; commit(); } };
 con.addEventListener('pointerup', up); con.addEventListener('pointercancel', up);
+
+/* ---------- Rota de carro (OSRM) ---------- */
+let rw = [], rmk = [], rpending = null;
+const rline = L.polyline([], { color: '#f2b84b', weight: 5, opacity: .95, pane: 'draw' }).addTo(map);
+function resetPending() { rpending = null; rline.setLatLngs([]); $('confirm').hidden = true; }
+function clearRoute() { rw = []; rmk.forEach(m => map.removeLayer(m)); rmk = []; resetPending(); }
+function addWaypoint(lat, lng) {
+  if (rw.length >= 25) return toast('Máximo de 25 pontos por rota.');
+  resetPending(); rw.push([lat, lng]);
+  rmk.push(L.circleMarker([lat, lng], { radius: 7, color: '#15202b', weight: 2, fillColor: '#f2b84b', fillOpacity: 1, pane: 'draw' })
+    .bindTooltip(String.fromCharCode(64 + rw.length), { permanent: true, direction: 'top', offset: [0, -6] }).addTo(map));
+  $('hint').textContent = rw.length < 2 ? 'Agora marque o destino.' : rw.length + ' pontos. Calcule a rota ou adicione mais pontos.';
+}
+async function calcRoute() {
+  if (rw.length < 2) return toast('Marque ao menos a origem e o destino.');
+  const b = $('rgo'); b.disabled = true; b.textContent = 'Calculando…';
+  try {
+    const url = 'https://router.project-osrm.org/route/v1/driving/' + rw.map(p => p[1] + ',' + p[0]).join(';') + '?overview=full&geometries=geojson';
+    const j = await (await fetch(url)).json();
+    if (j.code !== 'Ok' || !j.routes.length) throw new Error(j.message || j.code);
+    const rt = j.routes[0];
+    rpending = rt.geometry.coordinates.map(c => [c[1], c[0]]);
+    rline.setLatLngs(rpending); map.fitBounds(rline.getBounds(), { padding: [70, 70] });
+    const h = Math.floor(rt.duration / 3600), m = Math.round(rt.duration % 3600 / 60);
+    $('csum').textContent = 'Rota de ' + Math.round(rt.distance / 1000).toLocaleString('pt-BR') + ' km, cerca de ' + (h ? h + ' h ' : '') + m + ' min de carro. Revelar com raio de ' + rad() + ' m?';
+    $('confirm').hidden = false;
+  } catch (e) { toast('Não consegui calcular a rota (' + e.message + ').'); }
+  b.disabled = false; b.textContent = 'Calcular rota';
+}
+map.on('click', e => { if (mode === 'route') addWaypoint(e.latlng.lat, e.latlng.lng); });
+$('rgo').onclick = calcRoute; $('rclr').onclick = () => { clearRoute(); $('hint').textContent = hints.route; };
+$('cno').onclick = resetPending;
+$('cok').onclick = () => {
+  if (!rpending) return;
+  const before = cells.size; cur = []; addLine(rpending, rad(), 1e9); commit();
+  toast('Rota revelada: ' + (cells.size - before).toLocaleString('pt-BR') + ' novas células.');
+  clearRoute(); $('hint').textContent = hints.route;
+};
 
 /* ---------- Importação (GPX, KML, GeoJSON, JSON do Google, backup) ---------- */
 function parseFile(name, text) {
@@ -339,7 +385,9 @@ $('q').onkeydown = async e => {
   if (e.key !== 'Enter' || !e.target.value.trim()) return;
   try {
     const r = await (await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(e.target.value))).json();
-    r[0] ? map.setView([+r[0].lat, +r[0].lon], 13) : toast('Lugar não encontrado.');
+    if (!r[0]) return toast('Lugar não encontrado.');
+    map.setView([+r[0].lat, +r[0].lon], mode === 'route' ? Math.max(map.getZoom(), 10) : 13);
+    if (mode === 'route') { addWaypoint(+r[0].lat, +r[0].lon); e.target.value = ''; }
   } catch (err) { toast('Busca indisponível agora.'); }
 };
 document.addEventListener('keydown', e => {
