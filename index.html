@@ -67,8 +67,14 @@ input[type=range]{flex:1;accent-color:#f2b84b}
 <div id="toast"></div>
 
 <script>
-/* ---------- Dados: células de ~38 m (tile z20), cada uma guarda o raio revelado ---------- */
-const Z = 20, CELL = 256, M = 2097152;
+/* ---------- Dados: células de ~9,5 m (tile z22), cada uma guarda o raio revelado ---------- */
+const Z = 22, CELL = 256, M = 2 ** 23, CM0 = CELL * 156543.03392 / 2 ** Z; // CM0 = tamanho da célula (m) no equador
+let maxR = 100;
+// converte chave de uma grade mais grossa (zf) para a grade atual, usando o centro da célula antiga
+function mig(k, zf) {
+  const mf = 2 ** (zf + 1), kx = Math.floor(k / mf), ky = k - kx * mf, f = 2 ** (Z - zf);
+  return (kx * f + (f >> 1)) * M + (ky * f + (f >> 1));
+}
 const cells = new Map();          // chave numérica -> raio (m)
 const history = [];               // ações para desfazer
 let cur = null;                   // ação em andamento
@@ -82,7 +88,7 @@ function toCell(lat, lon) {
 function add(lat, lon, r) {
   const [cx, cy] = toCell(lat, lon), k = cx * M + cy, p = cells.get(k);
   if (p === undefined || p < r) {
-    cells.set(k, r);
+    cells.set(k, r); if (r > maxR) maxR = r;
     if (cur) cur.push([k, p]);
     if (p === undefined) added++;
   }
@@ -96,7 +102,7 @@ function addLine(pts, r, gap) {
     const dx = (a[1] - b[1]) * Math.cos((a[0] + b[0]) * Math.PI / 360) * 111320, dy = (a[0] - b[0]) * 110540;
     const d = Math.hypot(dx, dy);
     if (d > gap) continue;
-    const n = Math.min(Math.ceil(d / Math.max(12, r * .7)), 20000);
+    const n = Math.min(Math.ceil(d / Math.max(8, r * .7)), 20000);
     for (let j = 1; j < n; j++) { const t = j / n; add(b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t, r); }
   }
 }
@@ -108,7 +114,7 @@ function toXY(lat, lon) {
 // o que sobra do círculo fora do disco é refeito com células pequenas, para não apagar mais que o pedido.
 function erase(lat, lon, Re) {
   const [fx, fy] = toXY(lat, lon), cx0 = Math.floor(fx), cy0 = Math.floor(fy);
-  const cm = 38.2187 * Math.cos(lat * Math.PI / 180), n = Math.ceil((Re + 500) / cm) + 1, gone = [];
+  const cm = CM0 * Math.cos(lat * Math.PI / 180), n = Math.ceil((Re + maxR) / cm) + 1, gone = [];
   for (let dx = -n; dx <= n; dx++) for (let dy = -n; dy <= n; dy++) {
     const k = (cx0 + dx) * M + (cy0 + dy), r = cells.get(k);
     if (r !== undefined && Math.hypot(cx0 + dx + .5 - fx, cy0 + dy + .5 - fy) * cm <= Re + r) gone.push([cx0 + dx, cy0 + dy, r, k]);
@@ -148,10 +154,10 @@ const kvGet = k => DB.then(db => new Promise((res, rej) => { const r = db.transa
 const kvSet = (k, v) => DB.then(db => new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }));
 const flat = () => { const a = new Float64Array(cells.size * 2); let i = 0; for (const [k, r] of cells) { a[i++] = k; a[i++] = r; } return a; };
 let saveT = 0;
-function save() { clearTimeout(saveT); saveT = setTimeout(() => kvSet('cells', flat()).catch(() => toast('Não consegui salvar no navegador. Use "Salvar backup".')), 400); }
+function save() { clearTimeout(saveT); saveT = setTimeout(() => Promise.all([kvSet('cells', flat()), kvSet('zv', Z)]).catch(() => toast('Não consegui salvar no navegador. Use "Salvar backup".')), 400); }
 function saveView() { kvSet('view', [map.getCenter().lat, map.getCenter().lng, map.getZoom()]).catch(() => {}); }
 function exportBackup() {
-  const blob = new Blob([JSON.stringify({ app: 'mapa-desbloqueavel', v: 1, cells: Array.from(flat()) })], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ app: 'mapa-desbloqueavel', v: 2, z: Z, cells: Array.from(flat()) })], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
   a.download = 'mapa-desbloqueado-' + new Date().toISOString().slice(0, 10) + '.json'; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
@@ -160,8 +166,8 @@ function exportBackup() {
 /* ---------- Mapa ---------- */
 const map = L.map('map', { zoomControl: false, zoomAnimation: false, doubleClickZoom: false, worldCopyJump: false, minZoom: 2 });
 L.control.zoom({ position: 'bottomright' }).addTo(map);
-const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' });
-const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Esri' });
+const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxNativeZoom: 19, maxZoom: 21, attribution: '© OpenStreetMap' });
+const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom: 19, maxZoom: 21, attribution: 'Esri' });
 osm.addTo(map);
 L.control.layers({ 'OpenStreetMap': osm, 'Satélite': sat }, null, { position: 'topright' }).addTo(map);
 
@@ -342,7 +348,8 @@ async function importFiles(files) {
       const text = await f.text();
       if (text.slice(0, 80).includes('mapa-desbloqueavel')) {
         const j = JSON.parse(text);
-        for (let i = 0; i < j.cells.length; i += 2) { const k = j.cells[i], r = j.cells[i + 1], p = cells.get(k); if (p === undefined || p < r) { cells.set(k, r); cur.push([k, p]); } }
+        const zf = j.z || 20;
+        for (let i = 0; i < j.cells.length; i += 2) { const k = zf === Z ? j.cells[i] : mig(j.cells[i], zf), r = j.cells[i + 1], p = cells.get(k); if (p === undefined || p < r) { cells.set(k, r); if (r > maxR) maxR = r; cur.push([k, p]); } }
         n++; continue;
       }
       const { lines, gap } = parseFile(f.name, text);
@@ -402,8 +409,9 @@ document.addEventListener('keydown', e => {
 (async () => {
   let v = null;
   try {
-    const a = await kvGet('cells');
-    if (a) for (let i = 0; i < a.length; i += 2) cells.set(a[i], a[i + 1]);
+    const a = await kvGet('cells'), zv = (await kvGet('zv')) || 20;
+    if (a) for (let i = 0; i < a.length; i += 2) { cells.set(zv === Z ? a[i] : mig(a[i], zv), a[i + 1]); if (a[i + 1] > maxR) maxR = a[i + 1]; }
+    if (a && zv !== Z) save();
     v = await kvGet('view');
   } catch (e) { toast('Armazenamento do navegador indisponível; use "Salvar backup".'); }
   v ? map.setView([v[0], v[1]], v[2]) : map.setView([20, 0], 3);
